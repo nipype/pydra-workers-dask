@@ -141,4 +141,4 @@ dmypy.json
 .DS_store
 
 # Generated files
-/pydra/workers/CHANGEME/_version.py
+/pydra/workers/dask/_version.py

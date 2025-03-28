@@ -7,108 +7,190 @@
 name: CI/CD
 
 on:
+  release:
+    types: [published]
   push:
-    branches: [ main, develop ]
-    tags: [ '*' ]
+    branches:
+      - main
   pull_request:
-    branches: [ main, develop ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  devcheck:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ['3.8', '3.12']  # Check oldest and newest versions
-        pip-flags: ['', '--editable']
-        pydra:
-        - 'pydra'
-        - '--editable git+https://github.com/nipype/pydra.git#egg=pydra'
 
+  build:
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install build dependencies
-      run: |
-        python -m pip install --upgrade pip
-    - name: Install Pydra
-      run: |
-        pip install ${{ matrix.pydra }}
-        python -c "import pydra as m; print(f'{m.__name__} {m.__version__} @ {m.__file__}')"
-    - name: Install task package
-      run: |
-        pip install ${{ matrix.pip-flags }} ".[dev]"
-        python -c "import pydra.workers.CHANGEME as m; print(f'{m.__name__} {m.__version__} @ {m.__file__}')"
-        python -c "import pydra as m; print(f'{m.__name__} {m.__version__} @ {m.__file__}')"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3
+      - run: pip install --upgrade build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Build archive
+        run: |
+          git clean -fxd
+          mkdir archive
+          git archive -o archive/pydra.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive
+          path: archive/
 
   test:
-    runs-on: ubuntu-latest
+    needs: ['build']
     strategy:
       matrix:
-        python-version: [3.7, 3.8, 3.9, '3.10']
-
+        os: [ubuntu-latest]
+        python-version: ['3.11', '3.12', '3.13']
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+      - name: Fetch tags
+        run: git fetch --prune --unshallow
+      - name: Setup Python version ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: |
+          pip install -e "."
+      - name: Run tests for Dask
+        run: |
+          pytest -v pydra/engine/tests/test_submitter.py --only-worker=dask --rootdir pydra --cov pydra --cov-config .coveragerc --cov-report xml:cov.xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v2
+        with:
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+
+  build-docs:
+    needs: ['build']
+    runs-on: ubuntu-latest
+    # Set up the environment so that it finds conda
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+    - name: Install Pandoc for NBSphinx
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pandoc
+    - name: Install Dependencies for virtual notifications in Adv.-Exec Tutorial
+      run: |
+          sudo apt update
+          sudo apt install -y xvfb libnotify-bin dbus-x11 xfce4-notifyd
+    - name: Start Virtual Display (for notifications)
+      run: |
+        Xvfb :99 &
+        export DISPLAY=:99
+        eval "$(dbus-launch --sh-syntax)"
+        echo "DISPLAY=:99" >> $GITHUB_ENV
+        echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+    - name: Start Notification Daemon (for notifications)
+      run: |
+        xfce4-notifyd &
+        sleep 2  # Give it some time to start
+    - name: Send Notification (test notifications)
+      run: |
+        notify-send "GitHub Runner Notification" "This is a test notification from GitHub Actions"
+    - name: Debug Running Processes (for notifications)
+      run: |
+        ps aux | grep notify
+        ps aux | grep xfce4-notifyd
+        dbus-monitor --session &
+        sleep 3
     - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Fetch tags
+      run: git fetch --prune --unshallow
+    - name: Install Minconda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        auto-activate-base: true
+        activate-environment: ""
+    - name: Install MRtrix via Conda
+      run: |
+        conda install -c mrtrix3 mrtrix3
+        mrconvert --version
+    - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install build dependencies
+        python-version: '3.x'
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-    - name: Install task package
+        pip install build twine
+    - name: Install package
+      run: pip install .[doc]
+    - name: Install Python3 kernel
+      run: python -m ipykernel install --user
+    - name: Build docs
       run: |
-        pip install ".[test]"
-        python -c "import pydra.workers.CHANGEME as m; print(f'{m.__name__} {m.__version__} @ {m.__file__}')"
-        python -c "import pydra as m; print(f'{m.__name__} {m.__version__} @ {m.__file__}')"
-    - name: Test with pytest
-      run: |
-        pytest -sv --doctest-modules pydra/workers/CHANGEME \
-            --cov pydra.workers.CHANGEME --cov-report xml
-    - uses: codecov/codecov-action@v3
-      if: ${{ always() }}
-
-
-  deploy:
-    needs: [devcheck, test]
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: [3.9]
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-        fetch-depth: 0
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install build tools
-      run: python -m pip install build twine
-    - name: Build source and wheel distributions
-      run: python -m build
-    - name: Check distributions
-      run: twine check dist/*
+        cd docs
+        make html
+        cd ..
     - uses: actions/upload-artifact@v4
       with:
-        name: distributions
-        path: dist/
-    # Deploy on tags if PYPI_API_TOKEN is defined in the repository secrets.
-    # Secrets are not accessible in the if: condition [0], so set an output variable [1]
-    # [0] https://github.community/t/16928
-    # [1] https://docs.github.com/en/actions/reference/workflow-commands-for-github-actions#setting-an-output-parameter
+        name: docs
+        path: docs/build/html
+
+  deploy:
+    needs: [build-docs, test]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download dist
+      uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist
     - name: Check for PyPI token on tag
       id: deployable
-      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
+      if: github.event_name == 'release'
       env:
         PYPI_API_TOKEN: "${{ secrets.PYPI_API_TOKEN }}"
       run: if [ -n "$PYPI_API_TOKEN" ]; then echo "DEPLOY=true" >> $GITHUB_OUTPUT; fi
     - name: Upload to PyPI
       if: steps.deployable.outputs.DEPLOY
-      uses: pypa/gh-action-pypi-publish@37f50c210e3d2f9450da2cd423303d6a14a6e29f  # v1.5.1
+      uses: pypa/gh-action-pypi-publish@release/v1
       with:
         user: __token__
         password: ${{ secrets.PYPI_API_TOKEN }}
+
+  deploy-docs:
+    needs: [build-docs, deploy]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download docs
+      uses: actions/download-artifact@v4
+      with:
+        name: docs
+        path: docs-build
+    - name: Check for GHPAGES_DEPLOY_KEY token
+      id: deployable
+      if: github.event_name == 'release'
+      env:
+        GHPAGES_DEPLOY_KEY: "${{ secrets.GHPAGES_DEPLOY_KEY }}"
+      run: if [ -n "$GHPAGES_DEPLOY_KEY" ]; then echo "DEPLOY=true" >> $GITHUB_OUTPUT; fi
+    - name: Deploy Docs to GitHub Pages
+      if: steps.deployable.outputs.DEPLOY
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GHPAGES_DEPLOY_KEY }}
+        publish_dir: docs-build
